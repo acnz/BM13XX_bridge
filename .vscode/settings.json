@@ -6,5 +6,6 @@
   "idf.port": "/dev/ttyUSB0",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
-  }
+  },
+  "idf.flashType": "UART"
 }
