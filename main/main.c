@@ -24,7 +24,7 @@
 #define PIN_NUM_MISO 19
 #define PIN_NUM_CLK  18
 #define PIN_NUM_CS   5
-#define SPI_SPEED_HZ (5 * 1000 * 1000) // 5 MHz seguro
+#define SPI_SPEED_HZ (2 * 1000 * 1000) // 5 MHz seguro
 
 static const char *TAG = "BM13XX_FPGA_MASTER";
 
