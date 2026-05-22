@@ -6,62 +6,39 @@
 #include "freertos/semphr.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
-#include "driver/spi_master.h"
 #include "esp_log.h"
-#include "esp_random.h"
+#include "esp_rom_crc.h" // Usa o algoritmo de CRC32 ultra-rápido da ROM do ESP32
 
-// ============================================================================
-// CONFIGURAÇÕES DE PINOS E BARRAMENTOS
-// ============================================================================
-// Pinos UART (Simulador BM13xx)
-#define SIM_TXD_PIN CONFIG_UART_TXD
-#define SIM_RXD_PIN CONFIG_UART_RXD
-#define SIM_UART_PORT CONFIG_UART_PORT_NUM
+// Configurações da UART0 (Comunicação com o PC / Stratum / NerdMiner)
+#define SIM_TXD_PIN      CONFIG_UART_TXD
+#define SIM_RXD_PIN      CONFIG_UART_RXD
+#define SIM_UART_PORT    CONFIG_UART_PORT_NUM
+
+// Configurações da UART1 (Comunicação Direta com a FPGA Tang Primer)
+#define FPGA_UART_PORT   UART_NUM_2
+#define FPGA_TXD_PIN     5  // Conecte ao pino URX da FPGA
+#define FPGA_RXD_PIN     23  // Conecte ao pino UTX da FPGA
+#define FPGA_BAUD_RATE   115200 // Deve bater exatamente com o baud_clk da FPGA
+
 #define BUF_SIZE 1024
 
-// Pinos SPI (Comunicação com o FPGA)
-#define PIN_NUM_MOSI 23
-#define PIN_NUM_MISO 19
-#define PIN_NUM_CLK  18
-#define PIN_NUM_CS   5
-#define SPI_SPEED_HZ (2 * 1000 * 1000) // 5 MHz seguro
+static const char *TAG = "BM13XX_FPGA_Driver";
 
-static const char *TAG = "BM13XX_FPGA_MASTER";
-
+// Mutex para proteção do barramento de transmissão com o PC
 static SemaphoreHandle_t uart_mutex;
-spi_device_handle_t fpga_spi;
 
-// Variáveis Globais de Trabalho (O Maestro UART atualiza, o Operário SPI lê)
+// Variáveis Globais do Trabalho (Armazenam os bytes brutos vindos do PC)
 volatile uint32_t g_job_version = 0;
-uint8_t g_midstate_raw[32];
-uint8_t g_data_raw[12];
-
+uint8_t g_midstate_bytes[32];
+uint8_t g_data_bytes[12];
 
 // ============================================================================
-// FUNÇÕES AUXILIARES E MATEMÁTICAS (CRCs E ENDIANNESS)
+// FUNÇÕES AUXILIARES DE COMUNICAÇÃO
 // ============================================================================
 
-// Inverte a ordem dos bytes (Little-Endian do ESP32 para Big-Endian do FPGA de 2011)
-uint32_t swap_endian(uint32_t v) { 
-    return (v << 24) | ((v << 8) & 0x00FF0000) | ((v >> 8) & 0x0000FF00) | (v >> 24); 
-}
-
-// CRC5 do barramento SPI (Hardware Customizado)
-uint8_t calculate_spi_crc5(uint8_t *data, int num_bits) {
-    uint8_t crc = 0x1F;
-    for (int i = 0; i < num_bits; i++) {
-        uint8_t byte = data[i / 8];
-        uint8_t bit = (byte >> (7 - (i % 8))) & 1;
-        uint8_t inv = bit ^ ((crc >> 4) & 1);
-        crc = (crc << 1) & 0x1F;
-        if (inv) crc ^= 0x05;
-    }
-    return crc;
-}
-
-// CRC5 Oficial do Protocolo Serial da Bitmain
-uint8_t get_bitmain_crc5(uint8_t *ptr, uint8_t len) {
-    uint8_t crc = 0x1F;
+// Calcula o checksum CRC5 exigido pelo protocolo de resposta da Bitmain para o PC
+uint8_t get_crc5(uint8_t *ptr, uint8_t len) {
+    uint8_t crc = 0x1f;
     for (int i = 0; i < len; i++) {
         crc ^= ptr[i];
         for (int j = 0; j < 8; j++) {
@@ -69,185 +46,195 @@ uint8_t get_bitmain_crc5(uint8_t *ptr, uint8_t len) {
             else crc <<= 1;
         }
     }
-    return ((crc >> 3) & 0x1F);
+    return ((crc >> 3) & 0x1f);
 }
 
-// ============================================================================
-// COMUNICAÇÃO UART COM O CONTROLADOR PRINCIPAL (STRATUM / POOL)
-// ============================================================================
-
-// Função que envia o Share encontrado de volta para a rede
+// Envia o Nonce premiado de volta para o software de mineração do PC
 void send_bitmain_response(uint32_t nonce) {
     unsigned char buf_nonce[11] = {0xAA, 0x55, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0};
     buf_nonce[4] = (nonce >> 24) & 0xFF; 
     buf_nonce[5] = (nonce >> 16) & 0xFF;
     buf_nonce[6] = (nonce >> 8)  & 0xFF; 
     buf_nonce[7] = (nonce >> 0)  & 0xFF;
-    buf_nonce[10] = get_bitmain_crc5(buf_nonce, 10);
+    buf_nonce[10] = get_crc5(buf_nonce, 10);
     
     if (xSemaphoreTake(uart_mutex, portMAX_DELAY)) {
         uart_write_bytes(SIM_UART_PORT, buf_nonce, 11);
         xSemaphoreGive(uart_mutex);
+        ESP_LOGE(TAG, "=> NONCE ENVIADO AO PC COM SUCESSO: %08lx", (unsigned long)nonce);
     }
 }
 
-// TAREFA MAESTRO: Fica ouvindo a UART, fingindo ser um BM13xx
+// ============================================================================
+// OPERÁRIO CORE 0: GERENCIADOR E DRIVER DA FPGA
+// ============================================================================
+static void miner_task(void *arg) {
+    int core_id = (int)arg;
+    
+    // Como a FPGA faz o cálculo pesado sozinha, não precisamos de duas CPUs disputando a UART.
+    // Colocamos o Core 1 em suspensão eterna para economizar energia e focar o Core 0 na FPGA.
+    if (core_id != 0) {
+        ESP_LOGW(TAG, "[Core %d] Entrando em modo passivo (FPGA gerenciada pelo Core 0).", core_id);
+        while(1) {
+            vTaskDelay(portMAX_DELAY);
+        }
+    }
+
+    uint32_t local_version = 0;
+    uint8_t fpga_packet[60];
+    uint8_t fpga_rx_buf[128];
+
+    ESP_LOGI(TAG, "[Core 0] Inicializando fiação da UART1 com a FPGA...");
+
+    // Configura e instala o driver da UART com a FPGA
+    uart_config_t fpga_uart_config = {
+        .baud_rate = FPGA_BAUD_RATE, 
+        .data_bits = UART_DATA_8_BITS, 
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1, 
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, 
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    ESP_ERROR_CHECK(uart_param_config(FPGA_UART_PORT, &fpga_uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(FPGA_UART_PORT, FPGA_TXD_PIN, FPGA_RXD_PIN, -1, -1));
+    ESP_ERROR_CHECK(uart_driver_install(FPGA_UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0));
+
+    ESP_LOGI(TAG, "[Core 0] Conexão com a FPGA estabelecida! Aguardando ordens do PC...");
+
+    while(1) {
+        // Se o Maestro (Core 1) receber um bloco novo do PC, o Core 0 acorda para repassar à FPGA
+        if (g_job_version != local_version) {
+            local_version = g_job_version;
+            ESP_LOGW(TAG, "Novo trabalho recebido do PC. Montando pacote MSG_PUSH_JOB (60 bytes)...");
+
+            // Limpa o buffer do pacote
+            memset(fpga_packet, 0, 60);
+            
+            // Montagem do Cabeçalho esperado pela máquina de estados do uart_comm.v
+            fpga_packet[0] = 60;   // msg_length (60 bytes totais: 4 header + 52 payload + 4 crc)
+            fpga_packet[1] = 0x00; // Padding interno
+            fpga_packet[2] = 0x00; // Padding interno
+            fpga_packet[3] = 0x04; // msg_type = MSG_PUSH_JOB (0x04)
+
+            // NonceMax (Bytes 4..7) -> Varredura completa até o teto máximo de 32 bits
+            fpga_packet[4] = 0xFF; fpga_packet[5] = 0xFF; fpga_packet[6] = 0xFF; fpga_packet[7] = 0xFF;
+            
+            // NonceMin (Bytes 8..11) -> Início do escaneamento elétrico a partir do zero
+            fpga_packet[8] = 0x00; fpga_packet[9] = 0x00; fpga_packet[10] = 0x00; fpga_packet[11] = 0x00;
+
+
+            // Data (Bytes 12..23) -> Injeção direta dos 12 bytes úteis (nTime, nBits, Merkle final)    
+            // Laço for inverte a ordem (0x15 vai para o índice 12 do pacote)
+            for (int i = 0; i < 12; i++) {
+                fpga_packet[12 + i] = g_data_bytes[11 - i];
+            }
+            //memcpy(&fpga_packet[12], g_data_bytes, 12);
+
+            // Midstate (Bytes 24..55) -> Injeção direta dos 32 bytes do Midstate pré-calculado
+            // Laço for inverte a ordem (0x90 vai para o índice 24 do pacote)
+            for (int i = 0; i < 32; i++) {
+                fpga_packet[24 + i] = g_midstate_bytes[31 - i];
+            }
+            //memcpy(&fpga_packet[24], g_midstate_bytes, 32);
+
+            // Calcula o CRC32 sobre os primeiros 56 bytes usando o hardware do ESP32
+            uint32_t crc = esp_rom_crc32_le(0, fpga_packet, 56);
+            memcpy(&fpga_packet[56], &crc, 4);
+
+            // Envia os 60 bytes estruturados para o pino URX da FPGA
+            uart_write_bytes(FPGA_UART_PORT, fpga_packet, 60);
+            ESP_LOGI(TAG, "Pacote enviado à FPGA. Motor de hash ativado!");
+        }
+
+        // Fica escutando se a FPGA enviou alguma resposta pelo pino UTX
+        int len = uart_read_bytes(FPGA_UART_PORT, fpga_rx_buf, sizeof(fpga_rx_buf), 10 / portTICK_PERIOD_MS);
+        if (len > 0) {
+            ESP_LOGI(TAG, "FPGA respondeu com %d bytes no barramento!", len);
+            
+            // Se você configurou sua FPGA para cuspir o Nonce premiado bruto em formato de 4 bytes:
+            if (len == 4) {
+                uint32_t found_nonce = ((uint32_t)fpga_rx_buf[3] << 24) |
+                                       ((uint32_t)fpga_rx_buf[2] << 16) |
+                                       ((uint32_t)fpga_rx_buf[1] << 8)  |
+                                       ((uint32_t)fpga_rx_buf[0] << 0);
+                
+                ESP_LOGE(TAG, "!!! GOLDEN NONCE ENCONTRADO PELA FPGA !!! Valor: %08lx", (unsigned long)found_nonce);
+                
+                // Envia o ticket premiado de volta para o PC
+                send_bitmain_response(found_nonce);
+            }
+        }
+
+        vTaskDelay(10 / portTICK_PERIOD_MS); // Evita estouro de Watchdog no Core 0
+    }
+}
+
+// ============================================================================
+// MAESTRO CORE 1: ESCUTA A PORTA SERIAL DO PC (PROTOCOLO BITMAIN 0x21)
+// ============================================================================
 static void uart_listener_task(void *arg) {
     uart_config_t uart_config = {
-        .baud_rate = 115200, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT,
+        .baud_rate = 115200, 
+        .data_bits = UART_DATA_8_BITS, 
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1, 
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, 
+        .source_clk = UART_SCLK_DEFAULT,
     };
     ESP_ERROR_CHECK(uart_param_config(SIM_UART_PORT, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(SIM_UART_PORT, SIM_TXD_PIN, SIM_RXD_PIN, -1, -1));
     ESP_ERROR_CHECK(uart_driver_install(SIM_UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0));
 
     uint8_t *data = (uint8_t *)malloc(BUF_SIZE);
-    ESP_LOGI(TAG, "Músculo (Emulador BM13xx) Iniciado. Aguardando Trabalho da UART...");
+    ESP_LOGI(TAG, "Maestro do Sistema Ativo. Aguardando comando 0x21 do PC...");
 
     while (1) {
         int len = uart_read_bytes(SIM_UART_PORT, data, 128, 20 / portTICK_PERIOD_MS);
         if (len > 0) {
-            // Responde a PINGs do controlador
+            // Responde às checagens de pulso (PING) do PC para não cair a conexão
             if (strstr((char*)data, "PING") != NULL) { 
                 uart_write_bytes(SIM_UART_PORT, "PONG", 4); 
                 continue; 
             }
 
-            // Detectou o Comando SEND_WORK (0x21) da Bitmain
+            // Detecta o comando clássico da Bitmain: 0x21 (SEND_WORK)
             if (len >= 6 && data[2] == 0x21) {
+                ESP_LOGE(TAG, "=> SEND_WORK Recebido do PC! Extraindo payloads brutos...");
                 uart_flush(SIM_UART_PORT);
 
-                // Copia os bytes crus da mensagem UART para as nossas pranchetas
-                memcpy(g_midstate_raw, &data[4], 32);
-                memcpy(g_data_raw, &data[36], 12);
+                // Captura os 32 bytes do Midstate pré-calculado (Vem a partir do byte index 4)
+                memcpy(g_midstate_bytes, &data[4], 32);
                 
-                // O GATILHO: Avisa a tarefa SPI que o trabalho mudou
+                // Captura os 12 bytes restantes de dados do bloco (Vem a partir do byte index 36)
+                memcpy(g_data_bytes, &data[36], 12);
+                
+                // Dispara o gatilho incrementando a versão do Job para acordar a tarefa da FPGA
                 g_job_version++; 
-                ESP_LOGI(TAG, "=> Novo Bloco (Job %lu) recebido da UART!", (unsigned long)g_job_version);
             }
-            // Negociação de Baudrate padrão da Bitmain
+            // Trata a negociação automática de Baudrate padrão exigida pela Bitmain
             else if (data[2] == 0x51 && data[5] == 0x28) {
                 uart_wait_tx_done(SIM_UART_PORT, 1000 / portTICK_PERIOD_MS);
                 uart_set_baudrate(SIM_UART_PORT, 1000000);
+                ESP_LOGW(TAG, "Baudrate alterado para 1.000.000 bps por ordem do PC.");
             }
         }
     }
 }
 
 // ============================================================================
-// O OPERÁRIO SPI: COMUNICAÇÃO DE ALTA VELOCIDADE COM O FPGA
-// ============================================================================
-
-static void fpga_miner_task(void *arg) {
-    ESP_LOGI(TAG, "FPGA SPI Miner Task iniciada. Aguardardando Jobs...");
-    
-    uint32_t local_job_version = 0;
-
-    while (1) {
-        // 1. VERIFICA SE HÁ UM NOVO TRABALHO DA INTERNET (UART)
-        if (local_job_version != g_job_version) {
-            local_job_version = g_job_version;
-            
-            // Monta o Payload de 47 bytes (Comando + ID + Midstate + Data + CRC)
-            uint8_t tx_buf[47] = {0};
-            tx_buf[0] = 0x01; // OPCODE: WRITE JOB
-            tx_buf[1] = (uint8_t)(local_job_version & 0xFF); 
-
-            // Aplica a Inversão de Endianness no Midstate (A cada 4 bytes)
-            for (int i = 0; i < 8; i++) {
-                uint32_t w;
-                memcpy(&w, &g_midstate_raw[i * 4], 4);
-                w = swap_endian(w);
-                memcpy(&tx_buf[2 + (i * 4)], &w, 4);
-            }
-
-            // Aplica a Inversão de Endianness no Header Data (A cada 4 bytes)
-            for (int i = 0; i < 3; i++) {
-                uint32_t w;
-                memcpy(&w, &g_data_raw[i * 4], 4);
-                w = swap_endian(w);
-                memcpy(&tx_buf[34 + (i * 4)], &w, 4);
-            }
-
-            // Blinda o pacote com o CRC5
-            tx_buf[46] = calculate_spi_crc5(tx_buf, 46 * 8);
-
-            spi_transaction_t t;
-            memset(&t, 0, sizeof(t));
-            t.length = 47 * 8; 
-            t.tx_buffer = tx_buf;
-            
-            spi_device_transmit(fpga_spi, &t);
-            ESP_LOGI(TAG, "=> Job %lu enviado para o Silício FPGA! [CRC SPI: 0x%02X]", 
-                    (unsigned long)local_job_version, tx_buf[46]);
-        }
-
-        // 2. POLLING CONTÍNUO: PERGUNTA AO FPGA SE ACHOU UM NONCE
-        if (local_job_version > 0) {
-            uint8_t poll_cmd[7] = {0x02, 0, 0, 0, 0, 0, 0}; 
-            uint8_t poll_rx[7]  = {0};
-
-            spi_transaction_t t_poll;
-            memset(&t_poll, 0, sizeof(t_poll));
-            t_poll.length = 7 * 8; 
-            t_poll.tx_buffer = poll_cmd;
-            t_poll.rx_buffer = poll_rx;
-
-            spi_device_transmit(fpga_spi, &t_poll);
-
-            uint8_t status = poll_rx[1];
-            if (status == 0x01) { 
-                uint32_t nonce = (poll_rx[2] << 24) | (poll_rx[3] << 16) | (poll_rx[4] << 8) | poll_rx[5];
-                uint8_t fpga_crc = poll_rx[6];
-                uint8_t calc_crc = calculate_spi_crc5(&poll_rx[1], 5 * 8);
-
-                if (fpga_crc == calc_crc) {
-                    ESP_LOGW(TAG, "$$$ SHARE ENCONTRADO NO FPGA: 0x%08X $$$", (unsigned int)nonce);
-                    
-                    // DEVOLVE PARA A INTERNET VIA UART!
-                    send_bitmain_response(nonce); 
-                } else {
-                    ESP_LOGE(TAG, "[ERRO CRC SPI] Nonce ignorado por corrupção no barramento.");
-                }
-            }
-        }
-
-        // Atraso de 10ms para não explodir o FreeRTOS e deixar o WiFi/UART respirar
-        vTaskDelay(pdMS_TO_TICKS(10)); 
-    }
-}
-
-// ============================================================================
-// MAIN DO SISTEMA
+// ENTRADA PRINCIPAL DO FIRMWARE
 // ============================================================================
 void app_main(void) {
     uart_mutex = xSemaphoreCreateMutex();
 
-    ESP_LOGI(TAG, "Inicializando Barramento SPI VSPI (Modo Mestre)...");
+    ESP_LOGI(TAG, "=================================================");
+    ESP_LOGI(TAG, "   INICIANDO MAESTRO CO-PROCESSADOR DE FPGA      ");
+    ESP_LOGI(TAG, "=================================================");
+
+    // Cria a tarefa de escuta do PC (Maestro) presa no Core 1
+    xTaskCreatePinnedToCore(uart_listener_task, "uart_listener", 8192, NULL, 5, NULL, 1);
     
-    spi_bus_config_t buscfg = {
-        .miso_io_num = PIN_NUM_MISO,
-        .mosi_io_num = PIN_NUM_MOSI,
-        .sclk_io_num = PIN_NUM_CLK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 100 
-    };
-
-    spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = SPI_SPEED_HZ,
-        .mode = 0,                  
-        .spics_io_num = PIN_NUM_CS, 
-        .queue_size = 1,            
-    };
-
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
-    ESP_ERROR_CHECK(spi_bus_add_device(SPI3_HOST, &devcfg, &fpga_spi));
-    ESP_LOGI(TAG, "SPI Pronto a %d Hz!", SPI_SPEED_HZ);
-
-    // Inicia a tarefa que escuta a controladora (Pool/Internet) no Núcleo 0
-    xTaskCreatePinnedToCore(uart_listener_task, "uart_maestro", 8192, NULL, 5, NULL, 0);
-    
-    // Inicia a tarefa que alimenta e lê o FPGA no Núcleo 1
-    xTaskCreatePinnedToCore(fpga_miner_task, "fpga_miner", 4096, NULL, 4, NULL, 1);
+    // Cria as tarefas dos operários (O Core 0 gerenciará o hardware, o Core 1 dormirá)
+    xTaskCreatePinnedToCore(miner_task, "miner_core0", 8192, (void*)0, 10, NULL, 0);
+    xTaskCreatePinnedToCore(miner_task, "miner_core1", 8192, (void*)1, 10, NULL, 1);
 }
