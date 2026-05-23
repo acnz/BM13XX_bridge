@@ -7,36 +7,27 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
-#include "esp_rom_crc.h" // Usa o algoritmo de CRC32 ultra-rápido da ROM do ESP32
+#include "esp_rom_crc.h" 
 
-// Configurações da UART0 (Comunicação com o PC / Stratum / NerdMiner)
 #define SIM_TXD_PIN      CONFIG_UART_TXD
 #define SIM_RXD_PIN      CONFIG_UART_RXD
 #define SIM_UART_PORT    CONFIG_UART_PORT_NUM
 
-// Configurações da UART1 (Comunicação Direta com a FPGA Tang Primer)
 #define FPGA_UART_PORT   UART_NUM_2
-#define FPGA_TXD_PIN     5  // Conecte ao pino URX da FPGA
-#define FPGA_RXD_PIN     23  // Conecte ao pino UTX da FPGA
-#define FPGA_BAUD_RATE   115200 // Deve bater exatamente com o baud_clk da FPGA
+#define FPGA_TXD_PIN     5  
+#define FPGA_RXD_PIN     23 
+#define FPGA_BAUD_RATE   115200 
 
 #define BUF_SIZE 1024
 
-static const char *TAG = "BM13XX_FPGA_Driver";
+static const char *TAG = "BM13XX_FPGA_Miner";
 
-// Mutex para proteção do barramento de transmissão com o PC
 static SemaphoreHandle_t uart_mutex;
 
-// Variáveis Globais do Trabalho (Armazenam os bytes brutos vindos do PC)
 volatile uint32_t g_job_version = 0;
 uint8_t g_midstate_bytes[32];
 uint8_t g_data_bytes[12];
 
-// ============================================================================
-// FUNÇÕES AUXILIARES DE COMUNICAÇÃO
-// ============================================================================
-
-// Calcula o checksum CRC5 exigido pelo protocolo de resposta da Bitmain para o PC
 uint8_t get_crc5(uint8_t *ptr, uint8_t len) {
     uint8_t crc = 0x1f;
     for (int i = 0; i < len; i++) {
@@ -49,7 +40,29 @@ uint8_t get_crc5(uint8_t *ptr, uint8_t len) {
     return ((crc >> 3) & 0x1f);
 }
 
-// Envia o Nonce premiado de volta para o software de mineração do PC
+/**
+ * @brief Inverte a ordem das palavras de 32 bits (4 bytes) de um buffer.
+ * Mantém os bytes internos de cada palavra na mesma ordem.
+ */
+void reverse_32bit_words(const uint8_t *src, uint8_t *dst, size_t num_bytes) {
+    size_t num_words = num_bytes / 4;
+    for (size_t i = 0; i < num_words; i++) {
+        // Copia a palavra da posição inversa do 'src' para a posição atual do 'dst'
+        memcpy(&dst[i * 4], &src[(num_words - 1 - i) * 4], 4);
+    }
+}
+
+/**
+ * @brief Função auxiliar para imprimir o buffer como uma string Hex contínua (estilo FPGA)
+ */
+void log_fpga_format(const char *label, const uint8_t *buffer, size_t len) {
+    printf("I (%lu) %s: %s = \"", esp_log_timestamp(), TAG, label);
+    for (size_t i = 0; i < len; i++) {
+        printf("%02X", buffer[i]);
+    }
+    printf("\"\n");
+}
+
 void send_bitmain_response(uint32_t nonce) {
     unsigned char buf_nonce[11] = {0xAA, 0x55, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0};
     buf_nonce[4] = (nonce >> 24) & 0xFF; 
@@ -61,180 +74,121 @@ void send_bitmain_response(uint32_t nonce) {
     if (xSemaphoreTake(uart_mutex, portMAX_DELAY)) {
         uart_write_bytes(SIM_UART_PORT, buf_nonce, 11);
         xSemaphoreGive(uart_mutex);
-        ESP_LOGE(TAG, "=> NONCE ENVIADO AO PC COM SUCESSO: %08lx", (unsigned long)nonce);
+        ESP_LOGE(TAG, "=> SHARE REAL ENVIADO AO MICRO-STRATUM: %08lx", (unsigned long)nonce);
     }
 }
 
-// ============================================================================
-// OPERÁRIO CORE 0: GERENCIADOR E DRIVER DA FPGA
-// ============================================================================
 static void miner_task(void *arg) {
     int core_id = (int)arg;
-    
-    // Como a FPGA faz o cálculo pesado sozinha, não precisamos de duas CPUs disputando a UART.
-    // Colocamos o Core 1 em suspensão eterna para economizar energia e focar o Core 0 na FPGA.
-    if (core_id != 0) {
-        ESP_LOGW(TAG, "[Core %d] Entrando em modo passivo (FPGA gerenciada pelo Core 0).", core_id);
-        while(1) {
-            vTaskDelay(portMAX_DELAY);
-        }
-    }
+    if (core_id != 0) { vTaskDelay(portMAX_DELAY); }
 
-    uint32_t local_version = 0;
-    uint8_t fpga_packet[60];
-    uint8_t fpga_rx_buf[128];
-
-    ESP_LOGI(TAG, "[Core 0] Inicializando fiação da UART1 com a FPGA...");
-
-    // Configura e instala o driver da UART com a FPGA
     uart_config_t fpga_uart_config = {
-        .baud_rate = FPGA_BAUD_RATE, 
-        .data_bits = UART_DATA_8_BITS, 
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1, 
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, 
-        .source_clk = UART_SCLK_DEFAULT,
+        .baud_rate = FPGA_BAUD_RATE, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT,
     };
     ESP_ERROR_CHECK(uart_param_config(FPGA_UART_PORT, &fpga_uart_config));
     ESP_ERROR_CHECK(uart_set_pin(FPGA_UART_PORT, FPGA_TXD_PIN, FPGA_RXD_PIN, -1, -1));
     ESP_ERROR_CHECK(uart_driver_install(FPGA_UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0));
 
-    ESP_LOGI(TAG, "[Core 0] Conexão com a FPGA estabelecida! Aguardando ordens do PC...");
+    uint32_t local_version = 0;
+    uint8_t fpga_packet[60];
+    uint8_t fpga_rx_buf[128];
+
+    ESP_LOGI(TAG, "Link com a FPGA ativo. Aguardando a Pool enviar Jobs...");
 
     while(1) {
-        // Se o Maestro (Core 1) receber um bloco novo do PC, o Core 0 acorda para repassar à FPGA
         if (g_job_version != local_version) {
             local_version = g_job_version;
-            ESP_LOGW(TAG, "Novo trabalho recebido do PC. Montando pacote MSG_PUSH_JOB (60 bytes)...");
+            ESP_LOGW(TAG, "Novo Trabalho da Rede recebido! Atualizando FPGA...");
 
-            // Limpa o buffer do pacote
             memset(fpga_packet, 0, 60);
-            
-            // Montagem do Cabeçalho esperado pela máquina de estados do uart_comm.v
-            fpga_packet[0] = 60;   // msg_length (60 bytes totais: 4 header + 52 payload + 4 crc)
-            fpga_packet[1] = 0x00; // Padding interno
-            fpga_packet[2] = 0x00; // Padding interno
-            fpga_packet[3] = 0x04; // msg_type = MSG_PUSH_JOB (0x04)
+            fpga_packet[0] = 60; fpga_packet[3] = 0x04; // PUSH_JOB
 
-            // NonceMax (Bytes 4..7) -> Varredura completa até o teto máximo de 32 bits
+            // NonceMax
             fpga_packet[4] = 0xFF; fpga_packet[5] = 0xFF; fpga_packet[6] = 0xFF; fpga_packet[7] = 0xFF;
-            
-            // NonceMin (Bytes 8..11) -> Início do escaneamento elétrico a partir do zero
-            fpga_packet[8] = 0x00; fpga_packet[9] = 0x00; fpga_packet[10] = 0x00; fpga_packet[11] = 0x00;
+            //1dac2b7c  satoshi
+            // NonceMin
+            fpga_packet[8] = 0x00; fpga_packet[9] = 0x00; fpga_packet[10] = 0x00; fpga_packet[11] = 0x1a;
 
+            uint8_t temp_data_bytes[12];
+            // Executa a inversão do data
+            reverse_32bit_words(g_data_bytes, temp_data_bytes, sizeof(g_data_bytes));
+            memcpy(&fpga_packet[12], temp_data_bytes, 12);
+            log_fpga_format("FPGA Data", temp_data_bytes, sizeof(temp_data_bytes));
+            ESP_LOGW(TAG, "ffff001d29ab5f494b1e5e4a");
 
-            // Data (Bytes 12..23) -> Injeção direta dos 12 bytes úteis (nTime, nBits, Merkle final)    
-            // Laço for inverte a ordem (0x15 vai para o índice 12 do pacote)
-            for (int i = 0; i < 12; i++) {
-                fpga_packet[12 + i] = g_data_bytes[11 - i];
-            }
-            //memcpy(&fpga_packet[12], g_data_bytes, 12);
+            uint8_t temp_midstate_bytes[32];
+            // Executa a inversão do Midstate
+            reverse_32bit_words(g_midstate_bytes, temp_midstate_bytes, sizeof(g_midstate_bytes));
+            memcpy(&fpga_packet[24], temp_midstate_bytes, 32);
+            log_fpga_format("FPGA Midstate", temp_midstate_bytes, sizeof(temp_midstate_bytes));
+            ESP_LOGW(TAG, "4719F91B96B187364F0103C8C3C8D8E91E59CAA890CCAC7D6358BFF0BC909A33");
 
-            // Midstate (Bytes 24..55) -> Injeção direta dos 32 bytes do Midstate pré-calculado
-            // Laço for inverte a ordem (0x90 vai para o índice 24 do pacote)
-            for (int i = 0; i < 32; i++) {
-                fpga_packet[24 + i] = g_midstate_bytes[31 - i];
-            }
-            //memcpy(&fpga_packet[24], g_midstate_bytes, 32);
-
-            // Calcula o CRC32 sobre os primeiros 56 bytes usando o hardware do ESP32
             uint32_t crc = esp_rom_crc32_le(0, fpga_packet, 56);
             memcpy(&fpga_packet[56], &crc, 4);
 
-            // Envia os 60 bytes estruturados para o pino URX da FPGA
+            uart_flush(FPGA_UART_PORT);
             uart_write_bytes(FPGA_UART_PORT, fpga_packet, 60);
-            ESP_LOGI(TAG, "Pacote enviado à FPGA. Motor de hash ativado!");
         }
 
-        // Fica escutando se a FPGA enviou alguma resposta pelo pino UTX
+        // Fica ouvindo o retorno dos Nonces pela FPGA
         int len = uart_read_bytes(FPGA_UART_PORT, fpga_rx_buf, sizeof(fpga_rx_buf), 10 / portTICK_PERIOD_MS);
-        if (len > 0) {
-            ESP_LOGI(TAG, "FPGA respondeu com %d bytes no barramento!", len);
-            
-            // Se você configurou sua FPGA para cuspir o Nonce premiado bruto em formato de 4 bytes:
-            if (len == 4) {
-                uint32_t found_nonce = ((uint32_t)fpga_rx_buf[3] << 24) |
-                                       ((uint32_t)fpga_rx_buf[2] << 16) |
-                                       ((uint32_t)fpga_rx_buf[1] << 8)  |
-                                       ((uint32_t)fpga_rx_buf[0] << 0);
-                
-                ESP_LOGE(TAG, "!!! GOLDEN NONCE ENCONTRADO PELA FPGA !!! Valor: %08lx", (unsigned long)found_nonce);
-                
-                // Envia o ticket premiado de volta para o PC
-                send_bitmain_response(found_nonce);
-            }
+        if (len == 4) {
+            // CORREÇÃO CRIME 2: A FPGA manda o LSB primeiro. Lemos na ordem exata para não desvirar!
+            uint32_t found_nonce = ((uint32_t)fpga_rx_buf[3] << 24) | 
+                                   ((uint32_t)fpga_rx_buf[2] << 16) |
+                                   ((uint32_t)fpga_rx_buf[1] << 8)  | 
+                                   ((uint32_t)fpga_rx_buf[0] << 0);
+                                   
+            ESP_LOGE(TAG, "!!! SUCESSO !!! A FPGA DESTRUIU O HASH: %08lx", (unsigned long)found_nonce);
+            send_bitmain_response(found_nonce);
         }
-
-        vTaskDelay(10 / portTICK_PERIOD_MS); // Evita estouro de Watchdog no Core 0
+        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
 
-// ============================================================================
-// MAESTRO CORE 1: ESCUTA A PORTA SERIAL DO PC (PROTOCOLO BITMAIN 0x21)
-// ============================================================================
 static void uart_listener_task(void *arg) {
     uart_config_t uart_config = {
-        .baud_rate = 115200, 
-        .data_bits = UART_DATA_8_BITS, 
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1, 
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, 
-        .source_clk = UART_SCLK_DEFAULT,
+        .baud_rate = 115200, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT,
     };
     ESP_ERROR_CHECK(uart_param_config(SIM_UART_PORT, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(SIM_UART_PORT, SIM_TXD_PIN, SIM_RXD_PIN, -1, -1));
     ESP_ERROR_CHECK(uart_driver_install(SIM_UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0));
 
     uint8_t *data = (uint8_t *)malloc(BUF_SIZE);
-    ESP_LOGI(TAG, "Maestro do Sistema Ativo. Aguardando comando 0x21 do PC...");
 
     while (1) {
         int len = uart_read_bytes(SIM_UART_PORT, data, 128, 20 / portTICK_PERIOD_MS);
         if (len > 0) {
-            // Responde às checagens de pulso (PING) do PC para não cair a conexão
             if (strstr((char*)data, "PING") != NULL) { 
                 uart_write_bytes(SIM_UART_PORT, "PONG", 4); 
                 continue; 
             }
 
-            // Detecta o comando clássico da Bitmain: 0x21 (SEND_WORK)
-            if (len >= 6 && data[2] == 0x21) {
-                ESP_LOGE(TAG, "=> SEND_WORK Recebido do PC! Extraindo payloads brutos...");
+            if (len >= 6 && data[2] == 0x21) { 
                 uart_flush(SIM_UART_PORT);
-
-                // Captura os 32 bytes do Midstate pré-calculado (Vem a partir do byte index 4)
                 memcpy(g_midstate_bytes, &data[4], 32);
-                
-                // Captura os 12 bytes restantes de dados do bloco (Vem a partir do byte index 36)
                 memcpy(g_data_bytes, &data[36], 12);
-                
-                // Dispara o gatilho incrementando a versão do Job para acordar a tarefa da FPGA
+                ESP_LOGW(TAG, "[midstate]");
+                ESP_LOG_BUFFER_HEX(TAG, g_midstate_bytes, sizeof(g_midstate_bytes));
+                ESP_LOGW(TAG, "[data]");
+                ESP_LOG_BUFFER_HEX(TAG, g_data_bytes, sizeof(g_data_bytes));
+
                 g_job_version++; 
             }
-            // Trata a negociação automática de Baudrate padrão exigida pela Bitmain
-            else if (data[2] == 0x51 && data[5] == 0x28) {
+            else if (data[2] == 0x51 && data[5] == 0x28) { 
                 uart_wait_tx_done(SIM_UART_PORT, 1000 / portTICK_PERIOD_MS);
                 uart_set_baudrate(SIM_UART_PORT, 1000000);
-                ESP_LOGW(TAG, "Baudrate alterado para 1.000.000 bps por ordem do PC.");
             }
         }
     }
 }
 
-// ============================================================================
-// ENTRADA PRINCIPAL DO FIRMWARE
-// ============================================================================
 void app_main(void) {
     uart_mutex = xSemaphoreCreateMutex();
-
-    ESP_LOGI(TAG, "=================================================");
-    ESP_LOGI(TAG, "   INICIANDO MAESTRO CO-PROCESSADOR DE FPGA      ");
-    ESP_LOGI(TAG, "=================================================");
-
-    // Cria a tarefa de escuta do PC (Maestro) presa no Core 1
-    xTaskCreatePinnedToCore(uart_listener_task, "uart_listener", 8192, NULL, 5, NULL, 1);
-    
-    // Cria as tarefas dos operários (O Core 0 gerenciará o hardware, o Core 1 dormirá)
+    ESP_LOGI(TAG, "=== MAESTRO DA FPGA INICIADO ===");
+    xTaskCreatePinnedToCore(uart_listener_task, "uart_task", 8192, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(miner_task, "miner_core0", 8192, (void*)0, 10, NULL, 0);
     xTaskCreatePinnedToCore(miner_task, "miner_core1", 8192, (void*)1, 10, NULL, 1);
 }
