@@ -41,14 +41,16 @@ uint8_t get_crc5(uint8_t *ptr, uint8_t len) {
 }
 
 /**
- * @brief Inverte a ordem das palavras de 32 bits (4 bytes) de um buffer.
- * Mantém os bytes internos de cada palavra na mesma ordem.
+ * @brief Inverte a ordem dos BYTES dentro de cada palavra de 32 bits.
+ * Mantém a ordem das palavras intacta.
  */
-void reverse_32bit_words(const uint8_t *src, uint8_t *dst, size_t num_bytes) {
+void swap_bytes_in_32bit_words(const uint8_t *src, uint8_t *dst, size_t num_bytes) {
     size_t num_words = num_bytes / 4;
     for (size_t i = 0; i < num_words; i++) {
-        // Copia a palavra da posição inversa do 'src' para a posição atual do 'dst'
-        memcpy(&dst[i * 4], &src[(num_words - 1 - i) * 4], 4);
+        dst[i * 4 + 0] = src[i * 4 + 3]; // O último byte da palavra vira o primeiro
+        dst[i * 4 + 1] = src[i * 4 + 2];
+        dst[i * 4 + 2] = src[i * 4 + 1];
+        dst[i * 4 + 3] = src[i * 4 + 0]; // O primeiro byte vira o último
     }
 }
 
@@ -108,21 +110,21 @@ static void miner_task(void *arg) {
             fpga_packet[4] = 0xFF; fpga_packet[5] = 0xFF; fpga_packet[6] = 0xFF; fpga_packet[7] = 0xFF;
             //1dac2b7c  satoshi
             // NonceMin
-            fpga_packet[8] = 0x00; fpga_packet[9] = 0x00; fpga_packet[10] = 0x00; fpga_packet[11] = 0x1a;
+            fpga_packet[8] = 0x24; fpga_packet[9] = 0x11; fpga_packet[10] = 0x30; fpga_packet[11] = 0x08;
 
             uint8_t temp_data_bytes[12];
             // Executa a inversão do data
-            reverse_32bit_words(g_data_bytes, temp_data_bytes, sizeof(g_data_bytes));
+            swap_bytes_in_32bit_words(g_data_bytes, temp_data_bytes, sizeof(g_data_bytes));
             memcpy(&fpga_packet[12], temp_data_bytes, 12);
             log_fpga_format("FPGA Data", temp_data_bytes, sizeof(temp_data_bytes));
-            ESP_LOGW(TAG, "ffff001d29ab5f494b1e5e4a");
+            //ESP_LOGW(TAG, "ffff001d29ab5f494b1e5e4a");
 
             uint8_t temp_midstate_bytes[32];
             // Executa a inversão do Midstate
-            reverse_32bit_words(g_midstate_bytes, temp_midstate_bytes, sizeof(g_midstate_bytes));
+            swap_bytes_in_32bit_words(g_midstate_bytes, temp_midstate_bytes, sizeof(g_midstate_bytes));
             memcpy(&fpga_packet[24], temp_midstate_bytes, 32);
             log_fpga_format("FPGA Midstate", temp_midstate_bytes, sizeof(temp_midstate_bytes));
-            ESP_LOGW(TAG, "4719F91B96B187364F0103C8C3C8D8E91E59CAA890CCAC7D6358BFF0BC909A33");
+            //ESP_LOGW(TAG, "4719F91B96B187364F0103C8C3C8D8E91E59CAA890CCAC7D6358BFF0BC909A33");
 
             uint32_t crc = esp_rom_crc32_le(0, fpga_packet, 56);
             memcpy(&fpga_packet[56], &crc, 4);
